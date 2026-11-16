@@ -1,26 +1,26 @@
 import chromadb
 import os
 from google import genai
-from sklearn.metrics.pairwise import cosine_similarity
 
 # Create a persistent ChromaDB client
-client = chromadb.PersistentClient(
+chroma_client = chromadb.PersistentClient(
     path="./chroma_db"
 )
 
 # Create or access a collection
-collection = client.get_or_create_collection(
+collection = chroma_client.get_or_create_collection(
     name="my_documents"
 )
 
 print("ChromaDB initialized successfully!")
 
 DOCUMENTS_FOLDER = r"C:\Users\HP\Desktop\Python repos\Practice\documents"
- 
+
+
 def load_documents(folder_path):
     documents = []
 
-    for filename in os.listdir(folder_path): 
+    for filename in os.listdir(folder_path):
         if filename.endswith(".txt"):
             file_path = os.path.join(folder_path, filename)
 
@@ -36,7 +36,6 @@ def load_documents(folder_path):
 
 
 def chunk(text, chunk_size=1000, overlap=200):
-
     if chunk_size <= 0:
         raise ValueError("Chunk size must be greater than 0")
 
@@ -61,12 +60,40 @@ def chunk(text, chunk_size=1000, overlap=200):
 
     return chunks
 
+
+def keyword_search(query, all_chunks):
+    query_words = query.lower().split()
+    keyword_results = []
+
+    for item in all_chunks:
+        text = item["text"].lower()
+
+        score = sum(
+            1 for word in query_words
+            if word in text
+        )
+
+        if score > 0:
+            keyword_results.append({
+                "source": item["source"],
+                "text": item["text"],
+                "keyword_score": score
+            })
+
+    keyword_results.sort(
+        key=lambda item: item["keyword_score"],
+        reverse=True
+    )
+
+    return keyword_results[:3]
+
+
+# Load documents and split them into chunks
 documents = load_documents(DOCUMENTS_FOLDER)
 
 all_chunks = []
 
 for document in documents:
-
     chunks = chunk(document["text"], 400, 10)
 
     for item in chunks:
@@ -77,39 +104,43 @@ for document in documents:
         })
 
 
+# Connect to Gemini
 api_key = os.getenv("GEMINI_API_KEY")
+
+if not api_key:
+    raise ValueError("GEMINI_API_KEY is missing!")
+
 client = genai.Client(api_key=api_key)
 
 
 def embedding(text):
     response = client.models.embed_content(
-        model = 'gemini-embedding-2',
+        model="gemini-embedding-2",
         contents=text
-        )
+    )
+
     return response.embeddings[0].values
 
 
+# Generate embeddings for all chunks
 for item in all_chunks:
     item["embedding"] = embedding(item["text"])
 
-# Store all chunks and embeddings in ChromaDB
 
+# Store chunks, embeddings, and metadata in ChromaDB
 collection.upsert(
     ids=[
         f"{item['source']}_{item['chunk_id']}"
         for item in all_chunks
     ],
-
     documents=[
         item["text"]
         for item in all_chunks
     ],
-
     embeddings=[
         item["embedding"]
         for item in all_chunks
     ],
-
     metadatas=[
         {
             "source": item["source"],
@@ -120,43 +151,96 @@ collection.upsert(
 )
 
 print("Documents successfully stored in ChromaDB!")
-
 print("Total stored chunks:", collection.count())
 
 
-user_query = input("Enter your query: ")
+# Get the user's question
+user_query = input("\nEnter your query: ")
 
 query_embedding = embedding(user_query)
 
-results = collection.query(
-    query_embeddings=[query_embedding],
-    n_results = 3,
-    include=['documents','metadatas','distances']
-    )
 
-print("\nTop matching results:")
+# Day 21: Configurable top-K
+TOP_K = 5
+
+# Day 21: Similarity distance threshold
+# For ChromaDB's default L2 distance, smaller values indicate closer matches.
+# This is an experimental value; tune it based on your own results.
+MAX_DISTANCE = 1.0
+
+# Day 21: Metadata filtering
+# Set this to a filename, for example "python.txt", to search only that file.
+# Keep it as None to search across all documents.
+SOURCE_FILTER = None
+
+query_options = {
+    "query_embeddings": [query_embedding],
+    "n_results": min(TOP_K, collection.count()),
+    "include": ["documents", "metadatas", "distances"]
+}
+
+if SOURCE_FILTER:
+    query_options["where"] = {"source": SOURCE_FILTER}
+
+results = collection.query(**query_options)
+
+
+# Keep only semantic results that pass the distance threshold
+filtered_results = []
 
 for i in range(len(results["documents"][0])):
+    distance = results["distances"][0][i]
 
-    print(f"\nResult {i + 1}")
-
-    print("Source:", results["metadatas"][0][i]["source"])
-
-    print("Chunk ID:", results["metadatas"][0][i]["chunk_id"])
-
-    print("Distance:", results["distances"][0][i])
-
-    print("Content:", results["documents"][0][i])
+    if distance <= MAX_DISTANCE:
+        filtered_results.append({
+            "source": results["metadatas"][0][i]["source"],
+            "chunk_id": results["metadatas"][0][i]["chunk_id"],
+            "text": results["documents"][0][i],
+            "distance": distance
+        })
 
 
-# Extract retrieved documents
-retrieved_documents = results["documents"][0]
+print("\nSemantic Search Results (after distance filtering):")
 
-# Combine retrieved documents into context
-context = "\n\n".join(retrieved_documents)
+if filtered_results:
+    for i, item in enumerate(filtered_results, start=1):
+        print(f"\nResult {i}")
+        print("Source:", item["source"])
+        print("Chunk ID:", item["chunk_id"])
+        print("Distance:", item["distance"])
+        print("Content:", item["text"])
+else:
+    print("No results passed the distance threshold.")
 
-# Create prompt
-prompt = f"""
+
+# Day 21: Keyword search
+keyword_results = keyword_search(user_query, all_chunks)
+
+print("\nKeyword Search Results:")
+
+if keyword_results:
+    for i, item in enumerate(keyword_results, start=1):
+        print(f"\nResult {i}")
+        print("Source:", item["source"])
+        print("Keyword Score:", item["keyword_score"])
+        print("Content:", item["text"])
+else:
+    print("No keyword matches found.")
+
+
+# Use only threshold-approved semantic results as context for the answer
+retrieved_documents = [
+    item["text"]
+    for item in filtered_results
+]
+
+if not retrieved_documents:
+    print("\nGenerated Answer:")
+    print("I don't have enough relevant information in the retrieved documents to answer that.")
+else:
+    context = "\n\n".join(retrieved_documents)
+
+    prompt = f"""
 You are a helpful AI assistant.
 
 Answer the question using ONLY the provided context.
@@ -171,11 +255,10 @@ Question:
 {user_query}
 """
 
-# Generate answer using Gemini
-response = client.models.generate_content(
-    model="gemini-2.5-flash",
-    contents=prompt
-)
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
 
-print("\nGenerated Answer:")
-print(response.text)
+    print("\nGenerated Answer:")
+    print(response.text)
